@@ -1,0 +1,3 @@
+# Exclude uneccessary files
+.DS_Store
+.Rhistory
