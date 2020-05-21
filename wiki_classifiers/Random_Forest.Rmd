@@ -1,0 +1,278 @@
+---
+title: "RandomForest"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+```{r}
+# Libraries 
+library("tidyverse")
+library("tidytext")
+library("stringr")
+library("caret")
+library("tm") 
+library("SnowballC")
+library("wordcloud")
+library("glmnet")
+library("SnowballC")
+library("ggplot2")
+library("e1071")
+library("reshape")
+
+library("randomForest")
+library("caTools")
+```
+
+
+## Load data
+```{r}
+# Import training set
+train_set <- read.csv("my474/train.csv", header = TRUE, sep = ",", encoding = "UTF-8", stringsAsFactors = FALSE)
+
+# Create separate training set in for use with DataframeSource()
+wiki_train <- data.frame(doc_id = train_set$id, text = train_set$comment_text)
+str_replace_all(wiki_train, "[\r\n]", "")
+
+# Import test set
+test_set <- read.csv("test/test.csv", header = TRUE, sep = ",", encoding = "UTF-8", stringsAsFactors = FALSE)
+
+# Create df to use with VCorpus(Datafr)
+wiki_test <- data.frame(doc_id = test_set$id, text = test_set$comment_text)
+str_replace_all(wiki_test, "[\r\n]", "")
+
+
+```
+
+
+## Prepare data for training and testing
+```{r}
+set.seed(1)
+
+### Decide Train/Test Split ###
+id_train <- sample(1:nrow(wiki_train), 0.8*nrow(wiki_train))
+
+### Training Set ###
+# Prepare training set
+first_train <- train_set[id_train, ]
+
+# Create train set corpus
+train_corpus <- VCorpus(DataframeSource(wiki_train[id_train,]))
+
+
+### Validation Set ###
+# Prepare validation set
+mini_test_set <- wiki_train[-id_train, ]
+
+# Create validation corpus
+mini_test_corpus <- VCorpus(DataframeSource(mini_test_set))
+
+
+### Test Set ###
+# Prep test set for corpus creation
+colnames(test_set) <- c("doc_id", "text")
+
+# Create corpus
+test_corpus <- VCorpus(DataframeSource(wiki_test))
+
+
+### Response Vectors ###
+# Create response vectors
+y_toxic <- as.matrix(train_set$toxic)
+y_tox_train <- as.matrix(train_set$toxic[id_train])
+y_tox_test <- as.factor(as.matrix(train_set$toxic[-id_train]))
+  
+y_obscene <- as.matrix(train_set$obscene)
+y_obs_train <-  as.matrix(train_set$obscene[id_train])
+y_obs_test <- as.factor(as.matrix(train_set$obscene[-id_train]))
+
+```
+
+
+## Best pre-processing (from GLM)
+### Toxic
+```{r}
+## TOXIC: whitespace, punct, bin weighting
+# Create dtm
+tox_bin_combo1_dtm <- DocumentTermMatrix(train_corpus, control = list(stripWhitespace = TRUE,
+                                                                   removePunctuation = TRUE,
+                                                                   weighting = weightBin))
+
+# Reduce dimensionality (for computational efficiency)
+tox_bin_combo1_dtm <- removeSparseTerms(tox_bin_combo1_dtm, 0.99)
+
+
+# Create data frame
+df_toxdtm <- as.data.frame(as.matrix(tox_bin_combo1_dtm))
+df_toxdtm$toxic <- as.factor(first_train$toxic)
+names(df_toxdtm) <- make.names(names(df_toxdtm))
+
+# Split df
+split <- sample.split(df_toxdtm$toxic, SplitRatio = 0.8)
+train_tox_set <- subset(df_toxdtm, split == TRUE)
+test_tox_set <- subset(df_toxdtm, split == FALSE)
+
+```
+### Obscene
+```{r}
+## OBSCENE: punct, stemming, bin weighting
+
+# Create dtm
+bin_obcombo1_dtm <- DocumentTermMatrix(train_corpus, control = list(removePunctuation = TRUE,
+                                                                   stemming = TRUE,
+                                                                   weighting = weightBin))
+
+# Reduce dimensionality (for computational efficiency)
+bin_obcombo1_dtm <- removeSparseTerms(bin_obcombo1_dtm, 0.99)
+
+# Create data frame
+df_obsdtm <- as.data.frame(as.matrix(bin_obcombo1_dtm))
+df_obsdtm$obscene <- as.factor(first_train$obscene)
+names(df_obsdtm) <- make.names(names(df_obsdtm))
+
+# Split df
+split <- sample.split(df_obsdtm$obscene, SplitRatio = 0.8)
+train_obs_set <- subset(df_obsdtm, split == TRUE)
+test_obs_set <- subset(df_obsdtm, split == FALSE)
+
+```
+## Create random forest
+
+### Toxic
+```{r}
+# Run model
+tox_rf <- randomForest(toxic ~ ., mtry = sqrt(ncol(train_tox_set)), ntree = 500, data = train_tox_set)
+
+
+tox_rf
+```
+
+#### Test model
+```{r}
+tox_pred <- predict(tox_rf, newdata = test_tox_set[-ncol(test_tox_set)], type = "class")
+tox_cm <- prop.table(table(Model_Tox = test_tox_set[, ncol(test_tox_set)], Real_Tox = tox_pred))
+
+# Calculate F1
+tox_F1 <- F_meas(table(Model_Tox = test_tox_set[, ncol(test_tox_set)], Real_Tox = tox_pred))
+
+# Misclassification error
+tox_misclass <- mean(test_tox_set$toxic != tox_pred)
+```
+
+### Obscene
+
+```{r}
+# Run model
+obs_rf <- randomForest(obscene ~ ., mtry = sqrt(ncol(test_obs_set)), ntree = 500, data = test_obs_set)
+obs_rf
+
+tune_obs_rf <- tuneRF(train_obs_set[,-ncol(train_obs_set)], train_obs_set$obscene,
+                 mtryStart = sqrt(ncol(train_obs_set)), stepFactor = 0.5, doBest = TRUE)
+tune_obs_rf
+```
+
+#### Test model
+```{r}
+obs_pred <- predict(obs_rf, newdata = test_obs_set[-ncol(test_obs_set)], type = "class")
+obs_cm <- prop.table(table(Model_Obs = test_obs_set[, ncol(test_obs_set)], Real_Obs = obs_pred))
+
+
+# Calculate F1
+obs_F1 <- F_meas(table(Model_Obs = test_obs_set[, ncol(test_obs_set)], Real_Obs = obs_pred))
+
+# Calculate misclassification rate
+obs_misclass <- mean(test_obs_set$obscene != obs_pred)
+
+## Tune rf version
+tune_obs_pred <- predict(tune_obs_rf, newdata = test_obs_set[-ncol(test_obs_set)], type = "class")
+obs_cm <- prop.table(table(Model_Obs = test_obs_set[, ncol(test_obs_set)], Real_Obs = tune_obs_pred))
+
+
+# Calculate F1
+tune_obs_F1 <- F_meas(table(Model_Obs = test_obs_set[, ncol(test_obs_set)], Real_Obs = tune_obs_pred))
+
+# Calculate misclassification rate
+tune_obs_misclass <- mean(test_obs_set$obscene != tune_obs_pred)
+```
+
+## Prepare submission
+### Toxic
+```{r}
+## TOXIC: whitespace, punct, bin weighting
+# Create dtm
+tox_bin_combo1_dtm <- DocumentTermMatrix(train_corpus, control = list(stripWhitespace = TRUE,
+                                                                   removePunctuation = TRUE,
+                                                                   weighting = weightBin))
+
+# Create matrix
+tox_bin_combo1_X <- sparseMatrix(i = tox_bin_combo1_dtm$i, j = tox_bin_combo1_dtm$j, x = tox_bin_combo1_dtm$v,
+                  dims = c(tox_bin_combo1_dtm$nrow, tox_bin_combo1_dtm$ncol), dimnames = tox_bin_combo1_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_bincombo1_glm <- cv.glmnet(tox_bin_combo1_X, y_tox_train, type.measure = "class", family = "binomial")
+
+test_tox_dtm <- DocumentTermMatrix(test_corpus, 
+                            ## without this line predict won't work
+                            control = list(stripWhitespace = TRUE,
+                                           removePunctuation = TRUE,
+                                           weighting = weightBin,
+                                           dictionary = Terms(tox_bin_combo1_dtm))) # original dtm
+
+tox_test_X <- sparseMatrix(i = test_tox_dtm$i, j = test_tox_dtm$j, x = test_tox_dtm$v,
+                  dims = c(test_tox_dtm$nrow, test_tox_dtm$ncol), dimnames = test_tox_dtm$dimnames)
+
+
+# Create "toxic" submission
+toxic_pred <- predict(toxic_bincombo1_glm, tox_test_X, type = "class")
+df_toxic <- data.frame(row.names(toxic_pred), toxic_pred[, 1])
+colnames(df_toxic) <- c("id", "toxic")
+
+
+
+```
+
+### Obscene
+```{r}
+test_obs_dtm <- DocumentTermMatrix(test_corpus, 
+                            ## without this line predict won't work
+                            control = list(removePunctuation = TRUE,
+                                           stemming = TRUE,
+                                           weighting = weightBin,
+                                           dictionary = Terms(bin_obcombo1_dtm))) # original dtm
+
+# Create data frame
+df_test_obs <- as.data.frame(as.matrix(test_obs_dtm))
+names(df_test_obs) <- make.names(names(df_test_obs))
+
+# Add missing columns (source: https://stackoverflow.com/a/43663172)
+missingColumns <- setdiff(colnames(df_obsdtm),colnames(df_test_obs))
+df_test_obs[, missingColumns] <- 0 
+
+# Run model on test set
+test_obs_pred <- predict(obs_rf, df_test_obs, type = "class")
+
+# Create "obscene" submission
+df_obscene <- data.frame(names(test_obs_pred), test_obs_pred)
+colnames(df_obscene) <- c("id", "obscene")
+
+```
+
+### Create submission
+```{r}
+df_submission_8 <- merge(df_obscene, df_toxic, "id")
+
+# Get F1 scores
+submission_f1 <- rbind(submission_f1, list("submission 8", "toxic", 0.8787603), stringsAsFactors = FALSE) # same as submission 6
+submission_f1 <- rbind(submission_f1, list("submission 8", "obscene", obs_F1), stringsAsFactors = FALSE)
+
+# Write to csv
+write.csv(df_submission_8, "submission_8.csv", row.names = FALSE)
+
+# Load df
+load(file = "submission_misclass.RData")
+load(file = "sub6_tox_misclass.RData")
+submission_misclass <- rbind(submission_misclass, list("submission 8", tox_misclass6, obs_misclass), stringsAsFactors = FALSE)
+```

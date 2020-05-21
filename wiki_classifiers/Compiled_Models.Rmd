@@ -1,0 +1,1373 @@
+---
+title: "GLM Models"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+```{r}
+# Libraries 
+library("tidyverse")
+library("tidytext")
+library("stringr")
+library("caret")
+library("tm") 
+library("SnowballC")
+library("wordcloud")
+library("glmnet")
+library("SnowballC")
+library("ggplot2")
+library("e1071")
+library("reshape")
+
+```
+
+
+## Load data
+``` {r}
+# Import training set
+train_set <- read.csv("my474/train.csv", header = TRUE, sep = ",", encoding = "UTF-8", stringsAsFactors = FALSE)
+
+# Create separate training set in for use with DataframeSource()
+wiki_train <- data.frame(doc_id = train_set$id, text = train_set$comment_text)
+str_replace_all(wiki_train, "[\r\n]", "")
+
+# Import test set
+test_set <- read.csv("test/test.csv", header = TRUE, sep = ",", encoding = "UTF-8", stringsAsFactors = FALSE)
+
+# Create df to use with VCorpus(Datafr)
+wiki_test <- data.frame(doc_id = test_set$id, text = test_set$comment_text)
+str_replace_all(wiki_test, "[\r\n]", "")
+
+
+```
+
+
+## Prepare data for training and testing
+```{r}
+set.seed(1)
+
+### Decide Train/Test Split ###
+id_train <- sample(1:nrow(wiki_train), 0.8*nrow(wiki_train))
+
+### Training Set ###
+# Prepare training set
+first_train <- train_set[id_train, ]
+
+# Create train set corpus
+train_corpus <- VCorpus(DataframeSource(wiki_train[id_train,]))
+
+
+### Validation Set ###
+# Prepare validation set
+mini_test_set <- wiki_train[-id_train, ]
+
+# Create validation corpus
+mini_test_corpus <- VCorpus(DataframeSource(mini_test_set))
+
+### Test Set ###
+# Prep test set for corpus creation
+colnames(test_set) <- c("doc_id", "text")
+
+# Create corpus
+test_corpus <- VCorpus(DataframeSource(wiki_test))
+
+
+### Response Vectors ###
+# Create response vectors
+y_toxic <- as.matrix(train_set$toxic)
+y_tox_train <- as.matrix(train_set$toxic[id_train])
+y_tox_test <-as.matrix(train_set$toxic[-id_train])
+  
+y_obscene <- as.matrix(train_set$obscene)
+y_obs_train <-  as.matrix(train_set$obscene[id_train])
+y_obs_test <- as.matrix(train_set$obscene[-id_train])
+
+```
+
+
+## Functions
+```{r}
+# Create function to run glm models
+get_glm_results <- function(name, category, glm_mod, response_vector, df_results){
+  min_lambda <- glm_mod$lambda.min
+  min_cv <- glm_mod$cvm[which.min(glm_mod$cvm)]
+  new_row <- list(name, category, min_lambda, min_cv)
+  df_results <- rbind(df_results, new_row, stringsAsFactors = FALSE)
+  colnames(df_results) <- c("preprocessing", "category", "min_lambda", "min_cv")
+  return(df_results)
+}
+
+# Function to return test comment classification based on models
+clean_pred <- function(toxic_glm, obscene_glm, test_toxic_X, test_obscene_X){
+  
+  toxic_pred <- predict(toxic_glm, test_toxic_X, type = "class")
+  obscene_pred <- predict(obscene_glm, test_obscene_X, type = "class")
+  df_toxic <- data.frame(row.names(toxic_pred), toxic_pred[, 1])
+  colnames(df_toxic) <- c("id", "toxic")
+  df_obscene <- data.frame(row.names(obscene_pred), obscene_pred[, 1])
+  colnames(df_obscene) <- c("id", "obscene")
+  df_submission <- merge(df_toxic, df_obscene, "id")
+  
+  return(df_submission)
+}
+
+# Compute F1 results
+compile_f1 <- function(name, toxic_predictions, obs_predictions, toxic_responsevector, obscene_responsevector){
+  # Create data frame to hold F1 scores
+  f1_results <- data.frame()
+  
+  # Calculate F1
+  toxic_F1 <- F_meas(table(as.matrix(toxic_predictions), toxic_responsevector))
+  obscene_F1 <- F_meas(table(as.matrix(obs_predictions), obscene_responsevector))
+  
+  # Add to df
+  toxic_row <- list(as.character(name), as.character("toxic"), toxic_F1)
+  f1_results <- rbind(f1_results, toxic_row, stringsAsFactors = FALSE)
+  
+  obscene_row <- list(as.character(name), as.character("obscene"), obscene_F1)
+  f1_results <- rbind(f1_results, obscene_row, stringsAsFactors = FALSE)
+  
+  # Format df
+  colnames(f1_results) <- c("name", "category", "F1")
+  
+  return(f1_results)
+}
+
+```
+
+# GLM - Lasso
+## Explore pre-processing
+### No pre-processing
+```{r}
+# Create dtm
+none_dtm <- DocumentTermMatrix(train_corpus) # no pre-processing
+
+# Create sparse matrix for cv.glmnet
+none_X <- sparseMatrix(i = none_dtm$i, j = none_dtm$j, x = none_dtm$v,
+                  dims = c(none_dtm$nrow, none_dtm$ncol), dimnames = none_dtm$dimnames)
+
+# Create toxic model 
+toxic_none_glm <- cv.glmnet(none_X, y_tox_train, type.measure = "class", family = "binomial")
+
+# Create obscene model
+obscene_none_glm <- cv.glmnet(none_X, y_obs_train, type.measure = "class", family = "binomial")
+
+# Check coefficients
+# Get toxic coefs
+toxic_coefs <- as.vector(coef(toxic_none_glm))
+names(toxic_coefs) <- dimnames(coef(toxic_none_glm))[[1]]
+# Top 10 largest coeff values
+head(names(toxic_coefs[order(toxic_coefs, decreasing = TRUE)]), n = 10)
+
+# Get obscene coefs
+obscene_coefs <- as.vector(coef(obscene_none_glm))
+names(obscene_coefs) <- dimnames(coef(obscene_none_glm))[[1]]
+# Top 10 largest coeff values
+head(names(obscene_coefs[order(obscene_coefs, decreasing = TRUE)]), n = 10)
+```
+
+### Remove stopwords
+```{r}
+# Create dtm
+stpwrds_dtm <- DocumentTermMatrix(train_corpus, control = list(stopwords = TRUE))
+
+# Create matrix
+stpwrds_X <- sparseMatrix(i = stpwrds_dtm$i, j = stpwrds_dtm$j, x = stpwrds_dtm$v,
+                  dims = c(stpwrds_dtm$nrow, stpwrds_dtm$ncol), dimnames = stpwrds_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_stpwrds_glm <- cv.glmnet(stpwrds_X, y_tox_train, type.measure = "class", family = "binomial")
+
+# Get and record min cv and best lambda
+obscene_stpwrds_glm <- cv.glmnet(stpwrds_X, y_obs_train, type.measure = "class", family = "binomial")
+
+
+```
+
+
+### Tf-idf weighting
+```{r}
+# Create dtm
+tfidf_dtm <- DocumentTermMatrix(train_corpus, control = list(weighting = weightTfIdf))
+
+# Create matrix
+tfidf_X <- sparseMatrix(i = tfidf_dtm$i, j = tfidf_dtm$j, x = tfidf_dtm$v,
+                  dims = c(tfidf_dtm$nrow, tfidf_dtm$ncol), dimnames = tfidf_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_tfidf_glm <- cv.glmnet(tfidf_X, y_tox_train, type.measure = "class", family = "binomial")
+obscene_tfidf_glm <- cv.glmnet(tfidf_X, y_obs_train, type.measure = "class", family = "binomial")
+
+
+
+```
+
+
+### Stemming
+```{r}
+# Create dtm
+stemmed_dtm <- DocumentTermMatrix(train_corpus, control = list(stemming = TRUE))
+
+# Create matrix
+stemmed_X <- sparseMatrix(i = stemmed_dtm$i, j = stemmed_dtm$j, x = stemmed_dtm$v,
+                  dims = c(stemmed_dtm$nrow, stemmed_dtm$ncol), dimnames = stemmed_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_stemmed_glm <- cv.glmnet(stemmed_X, y_tox_train, type.measure = "class", family = "binomial")
+obscene_stemmed_glm <- cv.glmnet(stemmed_X, y_obs_train, type.measure = "class", family = "binomial")
+
+
+```
+
+
+### Tokenize
+```{r}
+# Create dtm
+token_dtm <- DocumentTermMatrix(train_corpus, control = list(tokenize = "words"))
+
+# Create matrix
+token_X <- sparseMatrix(i = token_dtm$i, j = token_dtm$j, x = token_dtm$v,
+                  dims = c(token_dtm$nrow, token_dtm$ncol), dimnames = token_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_token_glm <- cv.glmnet(token_X, y_tox_train, type.measure = "class", family = "binomial")
+obscene_token_glm <- cv.glmnet(token_X, y_obs_train, type.measure = "class", family = "binomial")
+
+
+
+```
+
+### Remove numbers
+```{r}
+# Create dtm
+rmvnumbers_dtm <- DocumentTermMatrix(train_corpus, control = list(removeNumbers = TRUE))
+
+# Create matrix
+rmvnumbers_X <- sparseMatrix(i = rmvnumbers_dtm$i, j = rmvnumbers_dtm$j, x = rmvnumbers_dtm$v,
+                  dims = c(rmvnumbers_dtm$nrow, rmvnumbers_dtm$ncol), dimnames = rmvnumbers_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_rmvnumbers_glm <- cv.glmnet(rmvnumbers_X, y_tox_train, type.measure = "class", family = "binomial")
+obscene_rmvnumbers_glm <- cv.glmnet(rmvnumbers_X, y_obs_train, type.measure = "class", family = "binomial")
+
+
+```
+
+### Remove punctuation
+```{r}
+# Create dtm
+rmvpunct_dtm <- DocumentTermMatrix(train_corpus, control = list(removePunctuation = TRUE))
+
+# Create matrix
+rmvpunct_X <- sparseMatrix(i = rmvpunct_dtm$i, j = rmvpunct_dtm$j, x = rmvpunct_dtm$v,
+                  dims = c(rmvpunct_dtm$nrow, rmvpunct_dtm$ncol), dimnames = rmvpunct_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_rmvpunct_glm <- cv.glmnet(rmvpunct_X, y_tox_train, type.measure = "class", family = "binomial")
+obscene_rmvpunct_glm <- cv.glmnet(rmvpunct_X, y_obs_train, type.measure = "class", family = "binomial")
+
+
+```
+
+### Remove whitespace
+```{r}
+# Create dtm
+rmvwhitespace_dtm <- DocumentTermMatrix(train_corpus, control = list(stripWhitespace = TRUE))
+
+# Create matrix
+rmvwhitespace_X <- sparseMatrix(i = rmvwhitespace_dtm$i, j = rmvwhitespace_dtm$j, x = rmvwhitespace_dtm$v,
+                  dims = c(rmvwhitespace_dtm$nrow, rmvwhitespace_dtm$ncol), dimnames = rmvwhitespace_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_rmvwhitespace_glm <- cv.glmnet(rmvwhitespace_X, y_tox_train, type.measure = "class", family = "binomial")
+obscene_rmvwhitespace_glm <- cv.glmnet(rmvwhitespace_X, y_obs_train, type.measure = "class", family = "binomial")
+
+
+
+```
+
+### Bin Weighting
+```{r}
+# Create dtm
+bin_dtm <- DocumentTermMatrix(train_corpus, control = list(weighting = weightBin))
+
+# Create matrix
+bin_X <- sparseMatrix(i = bin_dtm$i, j = bin_dtm$j, x = bin_dtm$v,
+                  dims = c(bin_dtm$nrow, bin_dtm$ncol), dimnames = bin_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_bin_glm <- cv.glmnet(bin_X, y_tox_train, type.measure = "class", family = "binomial")
+obscene_bin_glm <- cv.glmnet(bin_X, y_obs_train, type.measure = "class", family = "binomial")
+
+
+
+```
+
+### SMART Weighting 
+```{r}
+# Create dtm
+smart_dtm <- DocumentTermMatrix(train_corpus, control = list(weighting = weightSMART))
+
+# Create matrix
+smart_X <- sparseMatrix(i = smart_dtm$i, j = smart_dtm$j, x = smart_dtm$v,
+                  dims = c(smart_dtm$nrow, smart_dtm$ncol), dimnames = smart_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_smart_glm <- cv.glmnet(smart_X, y_tox_train, type.measure = "class", family = "binomial")
+obscene_smart_glm <- cv.glmnet(smart_X, y_obs_train, type.measure = "class", family = "binomial")
+
+
+```
+
+## Record best lambda and CV
+```{r}
+
+# Create data frame 
+df_glm_results <- data.frame()
+
+# No preprocessing
+df_glm_results <- get_glm_results("none", "toxic", toxic_none_glm, y_tox_train, df_glm_results)
+df_glm_results <- get_glm_results("none", "obscene", obscene_none_glm, y_tox_train, df_glm_results)
+
+# Remove stopwords
+df_glm_results <- get_glm_results("stopwords", "toxic", toxic_stpwrds_glm, y_tox_train, df_glm_results)
+df_glm_results <- get_glm_results("stopwords", "obscene", obscene_stpwrds_glm, y_tox_train, df_glm_results)
+
+# Tf-idf weighting
+df_glm_results <- get_glm_results("tf-idf", "toxic", toxic_tfidf_glm, y_tox_train, df_glm_results)
+df_glm_results <- get_glm_results("tf-idf", "obscene", obscene_tfidf_glm, y_obs_train, df_glm_results)
+
+# Stemming
+df_glm_results <- get_glm_results("stemming", "toxic", toxic_stemmed_glm, y_tox_train, df_glm_results)
+df_glm_results <- get_glm_results("stemming", "obscene", obscene_stemmed_glm, y_obs_train, df_glm_results)
+
+# Tokenize
+df_glm_results <- get_glm_results("tokenization", "toxic", toxic_token_glm, y_tox_train, df_glm_results)
+df_glm_results <- get_glm_results("tokenization", "obscene", obscene_token_glm, y_obs_train, df_glm_results)
+
+# Remove numbers
+df_glm_results <- get_glm_results("remove numbers", "toxic", toxic_rmvnumbers_glm, y_tox_train, df_glm_results)
+df_glm_results <- get_glm_results("remove numbers", "obscene", toxic_rmvnumbers_glm, y_obs_train, df_glm_results)
+
+# Remove punctuation
+df_glm_results <- get_glm_results("remove punctuation", "toxic", toxic_rmvpunct_glm, y_tox_train, df_glm_results)
+df_glm_results <- get_glm_results("remove punctuation", "obscene", obscene_rmvpunct_glm, y_obs_train, df_glm_results)
+
+# Remove whitespace
+df_glm_results <- get_glm_results("remove whitespace", "toxic", toxic_rmvwhitespace_glm, y_tox_train, df_glm_results)
+df_glm_results <- get_glm_results("remove whitespace", "obscene", obscene_rmvwhitespace_glm, y_obs_train, df_glm_results)
+
+# Bin weighting
+df_glm_results <- get_glm_results("bin weighting", "toxic", toxic_bin_glm, y_tox_train, df_glm_results)
+df_glm_results <- get_glm_results("bin weighting", "obscene", obscene_bin_glm, y_obs_train, df_glm_results)
+
+# SMART weighting
+df_glm_results <- get_glm_results("smart weighting", "toxic", toxic_smart_glm, y_tox_train, df_glm_results)
+df_glm_results <- get_glm_results("smart weighting", "obscene", toxic_smart_glm, y_obs_train, df_glm_results)
+
+
+```
+
+## Obscene weighting selection
+### Tf-idf + stemming + remove punctuation + remove whitespace
+```{r}
+# Create dtm
+tfidf_obcombo_dtm <- DocumentTermMatrix(train_corpus, control = list(stripWhitespace = TRUE,
+                                                                   removePunctuation = TRUE,
+                                                                   stemming = TRUE,
+                                                                   weighting = weightTfIdf))
+
+# Create matrix
+tfidf_obcombo_X <- sparseMatrix(i = tfidf_obcombo_dtm$i, j = tfidf_obcombo_dtm$j, x = tfidf_obcombo_dtm$v,
+                  dims = c(tfidf_obcombo_dtm$nrow, tfidf_obcombo_dtm$ncol), dimnames = tfidf_obcombo_dtm$dimnames)
+
+# Create models for toxic and obscene
+obs_tfidfcombo_glm <- cv.glmnet(tfidf_obcombo_X, y_obs_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("whitespace, punct, stemming, tfidf weighting", "obscene", obs_tfidfcombo_glm, y_tox_train, df_glm_results)
+
+```
+
+### Bin + stemming + remove punctuation + remove whitespace
+```{r}
+# Create dtm
+bin_obcombo_dtm <- DocumentTermMatrix(train_corpus, control = list(stripWhitespace = TRUE,
+                                                                   removePunctuation = TRUE,
+                                                                   stemming = TRUE,
+                                                                   weighting = weightBin))
+
+# Create matrix
+bin_obcombo_X <- sparseMatrix(i = bin_obcombo_dtm$i, j = bin_obcombo_dtm$j, x = bin_obcombo_dtm$v,
+                  dims = c(bin_obcombo_dtm$nrow, bin_obcombo_dtm$ncol), dimnames = bin_obcombo_dtm$dimnames)
+
+# Create models for toxic and obscene
+obs_bincombo_glm <- cv.glmnet(bin_obcombo_X, y_obs_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("whitespace, punct, stemming, bin weighting", "obscene", obs_bincombo_glm, y_tox_train, df_glm_results)
+
+```
+
+## Toxic weighting selection
+### Bin + remove whitespace + remove punctuation + tokenization
+```{r}
+# Create dtm
+bin_combo_dtm <- DocumentTermMatrix(train_corpus, control = list(stripWhitespace = TRUE,
+                                                                   removePunctuation = TRUE,
+                                                                   tokenize = "words",
+                                                                   weighting = weightBin))
+
+# Create matrix
+bin_combo_X <- sparseMatrix(i = bin_combo_dtm$i, j = bin_combo_dtm$j, x = bin_combo_dtm$v,
+                  dims = c(bin_combo_dtm$nrow, bin_combo_dtm$ncol), dimnames = bin_combo_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_bincombo_glm <- cv.glmnet(bin_combo_X, y_tox_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("whitespace, punct, token, bin weighting", "toxic", toxic_bincombo_glm, y_tox_train, df_glm_results)
+
+```
+
+### SMART + remove whitespace + remove punctuation + tokenization
+```{r}
+# Create dtm
+smart_combo_dtm <- DocumentTermMatrix(train_corpus, control = list(stripWhitespace = TRUE,
+                                                                   removePunctuation = TRUE,
+                                                                   tokenize = "words",
+                                                                   weighting = weightSMART))
+
+# Create matrix
+smart_combo_X <- sparseMatrix(i = smart_combo_dtm$i, j = smart_combo_dtm$j, x = smart_combo_dtm$v,
+                  dims = c(smart_combo_dtm$nrow, smart_combo_dtm$ncol), dimnames = smart_combo_dtm$dimnames)
+
+# Create model
+toxic_smartcombo_glm <- cv.glmnet(smart_combo_X, y_tox_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("whitespace, punct, token, SMART weighting", "toxic", toxic_smartcombo_glm, y_tox_train, df_glm_results)
+```
+
+## Create Submission
+### Run on mini test data
+```{r}
+### TOXIC: whitespace, punct, token, bin weighting	
+# Source: https://stackoverflow.com/a/35813297
+mini_test5_tox_dtm <- DocumentTermMatrix(mini_test_corpus, 
+                            ## without this line predict won't work
+                            control = list(stripWhitespace = TRUE,
+                                           removePunctuation = TRUE,
+                                           tokenize = "words",
+                                           weighting = weightBin,
+                                           dictionary = Terms(bin_combo_dtm))) # original dtm
+
+tox_test5_X <- sparseMatrix(i = mini_test5_tox_dtm$i, j = mini_test5_tox_dtm$j, x = mini_test5_tox_dtm$v,
+                  dims = c(mini_test5_tox_dtm$nrow, mini_test5_tox_dtm$ncol), dimnames = mini_test5_tox_dtm$dimnames)
+
+
+### OBSCENCE: Bin +  remove punctuation + remove whitespace + tokenization 
+mini_test5_obs_dtm <- DocumentTermMatrix(mini_test_corpus, 
+                            ## without this line predict won't work
+                            control = list(stripWhitespace = TRUE,
+                                           removePunctuation = TRUE,
+                                           stemming = TRUE,
+                                           weighting = weightBin,
+                                           dictionary = Terms(bin_obcombo_dtm))) # original dtm
+
+
+
+obs_test5_X <- sparseMatrix(i = mini_test5_obs_dtm$i, j = mini_test5_obs_dtm$j, x = mini_test5_obs_dtm$v,
+                  dims = c(mini_test5_obs_dtm$nrow, mini_test5_obs_dtm$ncol), dimnames = mini_test5_obs_dtm$dimnames)
+
+
+# Get results
+tox_pred5 <- predict(toxic_bincombo_glm, tox_test5_X, type = "class")
+obs_pred5 <- predict(obs_bincombo_glm, obs_test5_X, type = "class")
+
+# Get misclassification error (mean(y_predicted != y_actual))
+tox_val5 <- tox_pred5[, 1]
+tox_misclass5 <- mean(tox_val5 != y_tox_test)
+
+obs_val5 <- obs_pred5[, 1]
+obs_misclass5 <- mean(obs_val5 != y_obs_test)
+
+submission_misclass <- data.frame()
+submission_misclass <- rbind(submission_misclass, list("submission 5", tox_misclass5, obs_misclass5), stringsAsFactors = FALSE)
+colnames(submission_misclass) <- c("submission", "toxic_misclass", "obscene_misclass")
+
+
+# Calculate F1
+submission_f1 <- data.frame()
+submission_f1 <- compile_f1("submission 5", tox_val5, obs_val5, y_tox_test, y_obs_test)
+
+
+```
+
+### Submission 5
+```{r}
+### TOXIC: whitespace, punct, token, bin weighting	
+# Source: https://stackoverflow.com/a/35813297
+test5_tox_dtm <- DocumentTermMatrix(test_corpus, 
+                            ## without this line predict won't work
+                            control = list(stripWhitespace = TRUE,
+                                           removePunctuation = TRUE,
+                                           tokenize = "words",
+                                           weighting = weightBin,
+                                           dictionary = Terms(bin_combo_dtm))) # original dtm
+
+tox_test5_X <- sparseMatrix(i = test5_tox_dtm$i, j = test5_tox_dtm$j, x = test5_tox_dtm$v,
+                  dims = c(test5_tox_dtm$nrow, test5_tox_dtm$ncol), dimnames = test5_tox_dtm$dimnames)
+
+
+### OBSCENCE: Bin +  remove punctuation + remove whitespace + tokenization 
+test5_obs_dtm <- DocumentTermMatrix(test_corpus, 
+                            ## without this line predict won't work
+                            control = list(stripWhitespace = TRUE,
+                                           removePunctuation = TRUE,
+                                           stemming = TRUE,
+                                           weighting = weightBin,
+                                           dictionary = Terms(bin_obcombo_dtm))) # original dtm
+
+
+
+obs_test5_X <- sparseMatrix(i = test5_obs_dtm$i, j = test5_obs_dtm$j, x = test5_obs_dtm$v,
+                  dims = c(test5_obs_dtm$nrow, test5_obs_dtm$ncol), dimnames = test5_obs_dtm$dimnames)
+
+df_submission_5 <- clean_pred(toxic_bincombo_glm, obs_bincombo_glm, tox_test5_X, obs_test5_X)
+
+# Write to csv
+write.csv(df_submission_5, "submission_5.csv", row.names = FALSE)
+
+```
+
+## Obscene pre-processing selection
+
+### Bin + all options
+```{r}
+# Create dtm
+obs_allbin_dtm <- DocumentTermMatrix(train_corpus, control = list(removePunctuation = TRUE,
+                                                                    removeNumbers = TRUE,
+                                                                    removeWhitespace = TRUE,
+                                                                    removeStopwords = TRUE,
+                                                                    tokenize = "words",
+                                                                   stemming = TRUE,
+                                                                   weighting = weightBin))
+
+# Create matrix
+obs_allbin_X <- sparseMatrix(i = obs_allbin_dtm$i, j = obs_allbin_dtm$j, x = obs_allbin_dtm$v,
+                  dims = c(obs_allbin_dtm$nrow, obs_allbin_dtm$ncol), dimnames = obs_allbin_dtm$dimnames)
+
+# Create models for toxic and obscene
+obs_allbin_glm <- cv.glmnet(obs_allbin_X, y_obs_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("bin + all", "obscene", obs_allbin_glm, y_tox_train, df_glm_results)
+
+```
+
+### Bin + stemming + remove punctuation 
+```{r}
+# Create dtm
+bin_obcombo1_dtm <- DocumentTermMatrix(train_corpus, control = list(removePunctuation = TRUE,
+                                                                   stemming = TRUE,
+                                                                   weighting = weightBin))
+
+# Create matrix
+bin_obcombo1_X <- sparseMatrix(i = bin_obcombo1_dtm$i, j = bin_obcombo1_dtm$j, x = bin_obcombo1_dtm$v,
+                  dims = c(bin_obcombo1_dtm$nrow, bin_obcombo1_dtm$ncol), dimnames = bin_obcombo1_dtm$dimnames)
+
+# Create models for toxic and obscene
+obs_bincombo1_glm <- cv.glmnet(bin_obcombo1_X, y_obs_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("punct, stemming, bin weighting", "obscene", obs_bincombo_glm, y_tox_train, df_glm_results)
+```
+
+### Bin + stemming + remove whitespace
+```{r}
+# Create dtm
+bin_obcombo_dtm <- DocumentTermMatrix(train_corpus, control = list(stripWhitespace = TRUE,
+                                                                   stemming = TRUE,
+                                                                   weighting = weightBin))
+
+# Create matrix
+bin_obcombo_X <- sparseMatrix(i = bin_obcombo_dtm$i, j = bin_obcombo_dtm$j, x = bin_obcombo_dtm$v,
+                  dims = c(bin_obcombo_dtm$nrow, bin_obcombo_dtm$ncol), dimnames = bin_obcombo_dtm$dimnames)
+
+# Create models for toxic and obscene
+obs_bincombo_glm <- cv.glmnet(bin_obcombo_X, y_obs_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("whitespace, stemming, bin weighting", "obscene", obs_bincombo_glm, y_tox_train, df_glm_results)
+```
+
+### Bin + remove punctuation + remove whitespace
+```{r}
+# Create dtm
+bin_obcombo2_dtm <- DocumentTermMatrix(train_corpus, control = list(stripWhitespace = TRUE,
+                                                                   removePunctuation = TRUE,
+                                                                   weighting = weightBin))
+
+# Create matrix
+bin_obcombo2_X <- sparseMatrix(i = bin_obcombo2_dtm$i, j = bin_obcombo2_dtm$j, x = bin_obcombo2_dtm$v,
+                  dims = c(bin_obcombo2_dtm$nrow, bin_obcombo2_dtm$ncol), dimnames = bin_obcombo2_dtm$dimnames)
+
+# Create models for toxic and obscene
+obs_bincombo2_glm <- cv.glmnet(bin_obcombo_X, y_obs_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("whitespace, punct, bin weighting", "obscene", obs_bincombo2_glm, y_tox_train, df_glm_results)
+```
+
+### Bin + stemming
+```{r}
+# Create dtm
+bin_obcombo_dtm <- DocumentTermMatrix(train_corpus, control = list(stemming = TRUE,
+                                                                   weighting = weightBin))
+
+# Create matrix
+bin_obcombo_X <- sparseMatrix(i = bin_obcombo_dtm$i, j = bin_obcombo_dtm$j, x = bin_obcombo_dtm$v,
+                  dims = c(bin_obcombo_dtm$nrow, bin_obcombo_dtm$ncol), dimnames = bin_obcombo_dtm$dimnames)
+
+# Create models for toxic and obscene
+obs_bincombo_glm <- cv.glmnet(bin_obcombo_X, y_obs_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("stemming, bin weighting", "obscene", obs_bincombo_glm, y_tox_train, df_glm_results)
+```
+
+### Bin + remove punctuation
+```{r}
+# Create dtm
+bin_obcombo_dtm <- DocumentTermMatrix(train_corpus, control = list(removePunctuation = TRUE,
+                                                                   weighting = weightBin))
+
+# Create matrix
+bin_obcombo_X <- sparseMatrix(i = bin_obcombo_dtm$i, j = bin_obcombo_dtm$j, x = bin_obcombo_dtm$v,
+                  dims = c(bin_obcombo_dtm$nrow, bin_obcombo_dtm$ncol), dimnames = bin_obcombo_dtm$dimnames)
+
+# Create models for toxic and obscene
+obs_bincombo_glm <- cv.glmnet(bin_obcombo_X, y_obs_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("punct, bin weighting", "obscene", obs_bincombo_glm, y_tox_train, df_glm_results)
+```
+
+### Bin + remove whitespace
+```{r}
+# Create dtm
+bin_obcombo_dtm <- DocumentTermMatrix(train_corpus, control = list(stripWhitespace = TRUE,
+                                                                   weighting = weightBin))
+
+# Create matrix
+bin_obcombo_X <- sparseMatrix(i = bin_obcombo_dtm$i, j = bin_obcombo_dtm$j, x = bin_obcombo_dtm$v,
+                  dims = c(bin_obcombo_dtm$nrow, bin_obcombo_dtm$ncol), dimnames = bin_obcombo_dtm$dimnames)
+
+# Create models for toxic and obscene
+obs_bincombo_glm <- cv.glmnet(bin_obcombo_X, y_obs_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("whitespace, bin weighting", "obscene", obs_bincombo_glm, y_tox_train, df_glm_results)
+```
+
+
+## Toxic pre-processing selection
+
+### Bin + all options
+```{r}
+# Create dtm
+tox_allbin_dtm <- DocumentTermMatrix(train_corpus, control = list(removePunctuation = TRUE,
+                                                                    removeNumbers = TRUE,
+                                                                    removeWhitespace = TRUE,
+                                                                    removeStopwords = TRUE,
+                                                                    tokenize = "words",
+                                                                   stemming = TRUE,
+                                                                   weighting = weightBin))
+
+# Create matrix
+tox_allbin_X <- sparseMatrix(i = tox_allbin_dtm$i, j = tox_allbin_dtm$j, x = tox_allbin_dtm$v,
+                  dims = c(tox_allbin_dtm$nrow, tox_allbin_dtm$ncol), dimnames = tox_allbin_dtm$dimnames)
+
+# Create models for toxic and obscene
+tox_allbin_glm <- cv.glmnet(tox_allbin_X, y_tox_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("bin + all", "toxic", tox_allbin_glm, y_tox_train, df_glm_results)
+
+
+```
+
+### Bin + remove punctuation + remove whitespace
+```{r}
+# Create dtm
+tox_bin_combo1_dtm <- DocumentTermMatrix(train_corpus, control = list(stripWhitespace = TRUE,
+                                                                   removePunctuation = TRUE,
+                                                                   weighting = weightBin))
+
+# Create matrix
+tox_bin_combo1_X <- sparseMatrix(i = tox_bin_combo1_dtm$i, j = tox_bin_combo1_dtm$j, x = tox_bin_combo1_dtm$v,
+                  dims = c(tox_bin_combo1_dtm$nrow, tox_bin_combo1_dtm$ncol), dimnames = tox_bin_combo1_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_bincombo1_glm <- cv.glmnet(tox_bin_combo1_X, y_tox_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("whitespace, punct, bin weighting", "toxic", toxic_bincombo_glm, y_tox_train, df_glm_results)
+```
+
+### Bin + remove punctuation + tokenization
+```{r}
+# Create dtm
+bin_combo_dtm <- DocumentTermMatrix(train_corpus, control = list(removePunctuation = TRUE,
+                                                                 tokenize = "words",
+                                                                 weighting = weightBin))
+
+# Create matrix
+bin_combo_X <- sparseMatrix(i = bin_combo_dtm$i, j = bin_combo_dtm$j, x = bin_combo_dtm$v,
+                  dims = c(bin_combo_dtm$nrow, bin_combo_dtm$ncol), dimnames = bin_combo_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_bincombo_glm <- cv.glmnet(bin_combo_X, y_tox_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("punct, token, bin weighting", "toxic", toxic_bincombo_glm, y_tox_train, df_glm_results)
+```
+
+### Bin + remove whitespace + tokenization
+```{r}
+# Create dtm
+bin_combo_dtm <- DocumentTermMatrix(train_corpus, control = list(stripWhitespace = TRUE,
+                                                                   tokenize = "words",
+                                                                   weighting = weightBin))
+
+# Create matrix
+bin_combo_X <- sparseMatrix(i = bin_combo_dtm$i, j = bin_combo_dtm$j, x = bin_combo_dtm$v,
+                  dims = c(bin_combo_dtm$nrow, bin_combo_dtm$ncol), dimnames = bin_combo_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_bincombo_glm <- cv.glmnet(bin_combo_X, y_tox_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("whitespace, token, bin weighting", "toxic", toxic_bincombo_glm, y_tox_train, df_glm_results)
+```
+
+### Bin + remove whitespace
+```{r}
+# Create dtm
+bin_combo_dtm <- DocumentTermMatrix(train_corpus, control = list(stripWhitespace = TRUE,
+                                                                   weighting = weightBin))
+
+# Create matrix
+bin_combo_X <- sparseMatrix(i = bin_combo_dtm$i, j = bin_combo_dtm$j, x = bin_combo_dtm$v,
+                  dims = c(bin_combo_dtm$nrow, bin_combo_dtm$ncol), dimnames = bin_combo_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_bincombo_glm <- cv.glmnet(bin_combo_X, y_tox_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("whitespace, bin weighting", "toxic", toxic_bincombo_glm, y_tox_train, df_glm_results)
+```
+
+### Bin + tokenization
+```{r}
+# Create dtm
+bin_combo_dtm <- DocumentTermMatrix(train_corpus, control = list(tokenize = "words",
+                                                                 weighting = weightBin))
+
+# Create matrix
+bin_combo_X <- sparseMatrix(i = bin_combo_dtm$i, j = bin_combo_dtm$j, x = bin_combo_dtm$v,
+                  dims = c(bin_combo_dtm$nrow, bin_combo_dtm$ncol), dimnames = bin_combo_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_bincombo_glm <- cv.glmnet(bin_combo_X, y_tox_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("token, bin weighting", "toxic", toxic_bincombo_glm, y_tox_train, df_glm_results)
+```
+
+### Bin +  remove punctuation
+```{r}
+# Create dtm
+bin_combo_dtm <- DocumentTermMatrix(train_corpus, control = list(removePunctuation = TRUE,
+                                                                 weighting = weightBin))
+
+# Create matrix
+bin_combo_X <- sparseMatrix(i = bin_combo_dtm$i, j = bin_combo_dtm$j, x = bin_combo_dtm$v,
+                  dims = c(bin_combo_dtm$nrow, bin_combo_dtm$ncol), dimnames = bin_combo_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_bincombo_glm <- cv.glmnet(bin_combo_X, y_tox_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("punct, bin weighting", "toxic", toxic_bincombo_glm, y_tox_train, df_glm_results)
+```
+
+
+## Create Submission
+
+### Submission 6:
+
+#### Run on mini test data
+```{r}
+## TOXIC: whitespace, punct, bin weighting
+# Source: https://stackoverflow.com/a/35813297
+mini_test_tox_dtm <- DocumentTermMatrix(mini_test_corpus, 
+                            ## without this line predict won't work
+                            control = list(stripWhitespace = TRUE,
+                                           removePunctuation = TRUE,
+                                           weighting = weightBin,
+                                           dictionary = Terms(tox_bin_combo1_dtm))) # original dtm
+
+tox_mini_test_X <- sparseMatrix(i = mini_test_tox_dtm$i, j = mini_test_tox_dtm$j, x = mini_test_tox_dtm$v,
+                  dims = c(mini_test_tox_dtm$nrow, mini_test_tox_dtm$ncol), dimnames = mini_test_tox_dtm$dimnames)
+
+## OBSCENE: punct, stemming, bin weighting
+mini_test_obs_dtm <- DocumentTermMatrix(mini_test_corpus, 
+                            ## without this line predict won't work
+                            control = list(removePunctuation = TRUE,
+                                           stemming = TRUE,
+                                           weighting = weightBin,
+                                           dictionary = Terms(bin_obcombo_dtm))) # original dtm
+
+
+obs_test_X <- sparseMatrix(i = mini_test_obs_dtm$i, j = mini_test_obs_dtm$j, x = mini_test_obs_dtm$v,
+                  dims = c(mini_test_obs_dtm$nrow, mini_test_obs_dtm$ncol), dimnames = mini_test_obs_dtm$dimnames)
+
+
+# Get results
+tox_pred6 <- predict(toxic_bincombo1_glm, tox_mini_test_X, type = "class")
+obs_pred6 <- predict(obs_bincombo1_glm, obs_test_X, type = "class")
+
+# Get misclassification error (mean(y_predicted != y_actual))
+tox_val6 <- tox_pred6[, 1]
+tox_misclass6 <- mean(tox_val6 != y_tox_test)
+
+obs_val6 <- obs_pred6[, 1]
+obs_misclass6 <- mean(obs_val6 != y_obs_test)
+
+submission_misclass <- rbind(submission_misclass, list("submission 6", tox_misclass6, obs_misclass6), stringsAsFactors = FALSE)
+
+save(submission_misclass, file = "final_misclass.RData")
+
+# Calculate F1
+submission_f1 <- rbind(submission_f1, compile_f1("submission 6", tox_val6, obs_val6, y_tox_test, y_obs_test), stringsAsFactors = FALSE)
+
+```
+
+#### Create submission
+```{r}
+
+## TOXIC: whitespace, punct, bin weighting
+# Source: https://stackoverflow.com/a/35813297
+test_tox_dtm <- DocumentTermMatrix(test_corpus, 
+                            ## without this line predict won't work
+                            control = list(stripWhitespace = TRUE,
+                                           removePunctuation = TRUE,
+                                           weighting = weightBin,
+                                           dictionary = Terms(bin_combo1_dtm))) # original dtm
+
+tox_test_X <- sparseMatrix(i = test_tox_dtm$i, j = test_tox_dtm$j, x = test_tox_dtm$v,
+                  dims = c(test_tox_dtm$nrow, test_tox_dtm$ncol), dimnames = test_tox_dtm$dimnames)
+
+## OBSCENE: punct, stemming, bin weighting
+test_obs_dtm <- DocumentTermMatrix(test_corpus, 
+                            ## without this line predict won't work
+                            control = list(removePunctuation = TRUE,
+                                           stemming = TRUE,
+                                           weighting = weightBin,
+                                           dictionary = Terms(bin_obcombo1_dtm))) # original dtm
+
+
+obs_test_X <- sparseMatrix(i = test_obs_dtm$i, j = test_obs_dtm$j, x = test_obs_dtm$v,
+                  dims = c(test_obs_dtm$nrow, test_obs_dtm$ncol), dimnames = test_obs_dtm$dimnames)
+
+df_submission_6 <- clean_pred(toxic_bincombo1_glm, obs_bincombo1_glm, tox_test_X, obs_test_X)
+
+# Write to csv
+write.csv(df_submission_6, "submission_6.csv", row.names = FALSE)
+
+
+```
+
+### Submission 7: 
+#### Run on mini test data
+```{r}
+## TOXIC: all, bin weighting
+# Source: https://stackoverflow.com/a/35813297
+mini_test_tox_dtm <- DocumentTermMatrix(mini_test_corpus, 
+                            ## without this line predict won't work
+                            control = list(removePunctuation = TRUE,
+                                                                    removeNumbers = TRUE,
+                                                                    removeWhitespace = TRUE,
+                                                                    removeStopwords = TRUE,
+                                                                    tokenize = "words",
+                                                                   stemming = TRUE,
+                                                                   weighting = weightBin,
+                                           dictionary = Terms(tox_allbin_dtm))) # original dtm
+
+tox_mini_test_X <- sparseMatrix(i = mini_test_tox_dtm$i, j = mini_test_tox_dtm$j, x = mini_test_tox_dtm$v,
+                  dims = c(mini_test_tox_dtm$nrow, mini_test_tox_dtm$ncol), dimnames = mini_test_tox_dtm$dimnames)
+
+## OBSCENE: punct, stemming, bin weighting
+mini_test_obs_dtm <- DocumentTermMatrix(mini_test_corpus, 
+                            ## without this line predict won't work
+                            control = list(removePunctuation = TRUE,
+                                           stemming = TRUE,
+                                           weighting = weightBin,
+                                           dictionary = Terms(bin_obcombo1_dtm))) # original dtm
+
+
+obs_mini_test_X <- sparseMatrix(i = mini_test_obs_dtm$i, j = mini_test_obs_dtm$j, x = mini_test_obs_dtm$v,
+                  dims = c(mini_test_obs_dtm$nrow, mini_test_obs_dtm$ncol), dimnames = mini_test_obs_dtm$dimnames)
+
+# Get results
+tox_pred7 <- predict(tox_allbin_glm, tox_mini_test_X, type = "class")
+obs_pred7 <- predict(obs_bincombo1_glm, obs_mini_test_X, type = "class")
+
+# Get misclassification error (mean(y_predicted != y_actual))
+tox_val7 <- tox_pred7[, 1]
+tox_misclass7 <- mean(tox_val7 != y_tox_test)
+
+obs_val7 <- obs_pred7[, 1]
+obs_misclass7 <- mean(obs_val7 != y_obs_test)
+
+submission_misclass <- rbind(submission_misclass, c("submission 7", tox_misclass7, obs_misclass7), stringsAsFactors = FALSE)
+
+
+# Calculate F1
+submission_f1 <- rbind(submission_f1, compile_f1("submission 7", tox_val7, obs_val7, y_tox_test, y_obs_test), stringsAsFactors = FALSE)
+```
+
+
+#### Create submission
+```{r}
+## TOXIC: whitespace, punct, bin weighting
+# Source: https://stackoverflow.com/a/35813297
+test_tox_dtm <- DocumentTermMatrix(test_corpus, 
+                            ## without this line predict won't work
+                            control = list(removePunctuation = TRUE,
+                                                                    removeNumbers = TRUE,
+                                                                    removeWhitespace = TRUE,
+                                                                    removeStopwords = TRUE,
+                                                                    tokenize = "words",
+                                                                   stemming = TRUE,
+                                                                   weighting = weightBin,
+                                           dictionary = Terms(tox_allbin_dtm))) # original dtm
+
+tox_test_X <- sparseMatrix(i = test_tox_dtm$i, j = test_tox_dtm$j, x = test_tox_dtm$v,
+                  dims = c(test_tox_dtm$nrow, test_tox_dtm$ncol), dimnames = test_tox_dtm$dimnames)
+
+## OBSCENE: punct, stemming, bin weighting
+test_obs_dtm <- DocumentTermMatrix(test_corpus, 
+                            ## without this line predict won't work
+                            control = list(stripWhitespace = TRUE,
+                                           removePunctuation = TRUE,
+                                           weighting = weightBin,
+                                           dictionary = Terms(bin_obcombo_dtm))) # original dtm
+
+
+obs_test_X <- sparseMatrix(i = test_obs_dtm$i, j = test_obs_dtm$j, x = test_obs_dtm$v,
+                  dims = c(test_obs_dtm$nrow, test_obs_dtm$ncol), dimnames = test_obs_dtm$dimnames)
+
+df_submission_7 <- clean_pred(tox_allbin_glm, obs_bincombo1_glm, tox_test_X, obs_test_X)
+
+# Write to csv
+write.csv(df_submission_7, "submission_7.csv", row.names = FALSE)
+
+
+```
+
+## Create custom features
+
+### Best model (submission 6)
+```{r}
+## TOXIC: whitespace, punct, bin weighting
+# Create dtm
+tox_bin_combo1_dtm <- DocumentTermMatrix(train_corpus, control = list(stripWhitespace = TRUE,
+                                                                   removePunctuation = TRUE,
+                                                                   weighting = weightBin))
+
+# Create matrix
+tox_bin_combo1_X <- sparseMatrix(i = tox_bin_combo1_dtm$i, j = tox_bin_combo1_dtm$j, x = tox_bin_combo1_dtm$v,
+                  dims = c(tox_bin_combo1_dtm$nrow, tox_bin_combo1_dtm$ncol), dimnames = tox_bin_combo1_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_bincombo1_glm <- cv.glmnet(tox_bin_combo1_X, y_tox_train, type.measure = "class", family = "binomial")
+
+## OBSCENE: punct, stemming, bin weighting
+
+# Create dtm
+bin_obcombo1_dtm <- DocumentTermMatrix(train_corpus, control = list(removePunctuation = TRUE,
+                                                                   stemming = TRUE,
+                                                                   weighting = weightBin))
+
+# Create matrix
+bin_obcombo1_X <- sparseMatrix(i = bin_obcombo1_dtm$i, j = bin_obcombo1_dtm$j, x = bin_obcombo1_dtm$v,
+                  dims = c(bin_obcombo1_dtm$nrow, bin_obcombo1_dtm$ncol), dimnames = bin_obcombo1_dtm$dimnames)
+
+# Create models for toxic and obscene
+obs_bincombo1_glm <- cv.glmnet(bin_obcombo1_X, y_obs_train, type.measure = "class", family = "binomial")
+
+```
+
+
+### Uppercase
+#### Proportion of capital letters
+```{r}
+prop_uppercase <- str_count(first_train$comment_text, "[A-Z]")/
+  nchar(first_train$comment_text)
+
+
+mean(str_count(first_train$comment_text, "[A-Z]")/
+  nchar(first_train$comment_text))
+mean(str_count(first_train$comment_text[first_train$toxic == 1 |first_train$obscene ==1 ], "[A-Z]")/
+  nchar(first_train$comment_text[first_train$toxic == 1 |first_train$obscene ==1 ]))
+```
+
+#### Many uppercase
+```{r}
+many_uppercase <- factor(if_else(prop_uppercase > 0.25, 1, 0))
+sum(many_uppercase == 1)
+```
+
+#### Chain of uppercase
+```{r}
+chained_uppercase <- grepl("[A-Z]{5,}", first_train$comment_text)
+
+round(prop.table(table(Toxic = first_train$toxic, chained_uppercase), margin = 1) * 100)
+
+round(prop.table(table(Obscene = first_train$obscene, chained_uppercase), margin = 1) * 100)
+
+
+```
+
+### Punctuation marks
+
+#### Number of exclamation points
+```{r}
+count_exclamation_points <- str_count(first_train$comment_text, "!")
+
+# Count number of exclamation points in toxic/obscene vs. non-toxic/obscene comments
+num_excl_pts_tox <- sum(str_count(first_train$comment_text[which(first_train$toxic == 1)], "!"))
+num_excl_pts_obs <- sum(str_count(first_train$comment_text[which(first_train$obscene == 1)], "!"))
+
+num_excl_pts_nontox <- sum(str_count(first_train$comment_text[which(first_train$toxic == 0)], "!"))
+num_excl_pts_nonobs <- sum(str_count(first_train$comment_text[which(first_train$obs == 0)], "!"))
+
+```
+
+#### Number of question marks
+```{r}
+count_question_marks <- str_count(first_train$comment_text, "\\?")
+
+# Count number of exclamation points in toxic/obscene vs. non-toxic/obscene comments
+num_q_marks <- sum(str_count(first_train$comment_text[which(first_train$toxic == 1 | first_train$obscene == 1)], "\\?"))
+```
+
+#### Chain of exclamation points
+```{r}
+chained_exclamation_points <- grepl("!{2,}", first_train$comment_text)
+
+round(prop.table(table(Chained_ExclPts = chained_exclamation_points, Toxic = first_train$toxic), margin = 2),2)
+round(prop.table(table(Chained_ExclPts = chained_exclamation_points, Obscene = first_train$obscene), margin = 2),2)
+
+```
+
+#### Chain of question marks
+```{r}
+chained_question_marks <- grepl("\\?{2,}", first_train$comment_text)
+
+round(prop.table(table(Chained_QMarks = chained_question_marks, Toxic = first_train$toxic), margin = 2),2)
+round(prop.table(table(Chained_QMarks = chained_question_marks, Obscene = first_train$obscene), margin = 2),2)
+
+```
+
+### Add custom features to best models
+```{r}
+# Add to matrix from model with lowest misclass. error
+
+# Toxic (sub. 7)
+custom_tox_X <- cbind(tox_allbin_X, chained_question_marks, chained_exclamation_points, count_question_marks, count_exclamation_points, chained_uppercase, many_uppercase, prop_uppercase)
+
+# Obscene (sub 5)
+custom_obs_x <- cbind(bin_obcombo_X, chained_question_marks, chained_exclamation_points, count_question_marks, count_exclamation_points, chained_uppercase, many_uppercase, prop_uppercase)
+
+```
+
+#### Train model
+##### Toxic
+```{r}
+# Create model for toxic
+cust_tox_allbin_glm <- cv.glmnet(custom_tox_X, y_tox_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("custom + bin + all", "toxic", cust_tox_allbin_glm, y_tox_train, df_glm_results)
+
+```
+
+##### Obscene
+```{r}
+# Create models for toxic and obscene
+cust_obs_allbin_glm <- cv.glmnet(custom_obs_x, y_obs_train, type.measure = "class", family = "binomial")
+
+# Add to df 
+df_glm_results <- get_glm_results("custom + whitespace, punct, stemming, bin weighting", "obscene", cust_obs_allbin_glm, y_tox_train, df_glm_results)
+
+```
+
+#### Test model
+##### Toxic
+```{r}
+## TOXIC: all, bin weighting
+# Source: https://stackoverflow.com/a/35813297
+mini_test_tox_dtm <- DocumentTermMatrix(mini_test_corpus, 
+                            ## without this line predict won't work
+                            control = list(removePunctuation = TRUE,
+                                                                    removeNumbers = TRUE,
+                                                                    removeWhitespace = TRUE,
+                                                                    removeStopwords = TRUE,
+                                                                    tokenize = "words",
+                                                                   stemming = TRUE,
+                                                                   weighting = weightBin,
+                                           dictionary = Terms(tox_allbin_dtm))) # original dtm
+
+tox_mini_test_X <- sparseMatrix(i = mini_test_tox_dtm$i, j = mini_test_tox_dtm$j, x = mini_test_tox_dtm$v,
+                  dims = c(mini_test_tox_dtm$nrow, mini_test_tox_dtm$ncol), dimnames = mini_test_tox_dtm$dimnames)
+
+tox_mini_test_X <- cbind(tox_mini_test_X, chained_question_marks, chained_exclamation_points, count_question_marks, count_exclamation_points, chained_uppercase, many_uppercase, prop_uppercase)
+
+# Get results
+tox_pred9 <- predict(tox_allbin_glm, tox_mini_test_X, type = "class")
+
+
+# Get misclassification error (mean(y_predicted != y_actual))
+tox_val9 <- tox_pred9[, 1]
+tox_misclass9 <- mean(tox_val9 != y_tox_test)
+
+
+```
+
+##### Obscene
+```{r}
+mini_test_obs_dtm <- DocumentTermMatrix(mini_test_corpus, 
+                            ## without this line predict won't work
+                            control = list(stripWhitespace = TRUE,
+                                           removePunctuation = TRUE,
+                                           stemming = TRUE,
+                                           weighting = weightBin,
+                                           dictionary = Terms(bin_obcombo_dtm))) # original dtm
+
+
+
+obs_test9_X <- sparseMatrix(i = mini_test_obs_dtm$i, j = mini_test_obs_dtm$j, x = mini_test_obs_dtm$v,
+                  dims = c(mini_test_obs_dtm$nrow, mini_test_obs_dtm$ncol), dimnames = mini_test_obs_dtm$dimnames)
+
+obs_test9_X <- cbind(obs_test9_X, chained_question_marks, chained_exclamation_points, count_question_marks, count_exclamation_points, chained_uppercase, many_uppercase, prop_uppercase)
+
+# Get results
+obs_pred9 <- predict(cust_obs_allbin_glm, obs_test9_X, type = "class")
+
+# Get misclassification error (mean(y_predicted != y_actual))
+obs_val9 <- obs_pred9[, 1]
+obs_misclass9 <- mean(obs_val9 != y_obs_test)
+```
+
+
+## Create Submission 9
+### Toxic
+```{r}
+## TOXIC: whitespace, punct, bin weighting
+# Source: https://stackoverflow.com/a/35813297
+test9_tox_dtm <- DocumentTermMatrix(test_corpus, 
+                            ## without this line predict won't work
+                            control = list(removePunctuation = TRUE,
+                                                                    removeNumbers = TRUE,
+                                                                    removeWhitespace = TRUE,
+                                                                    removeStopwords = TRUE,
+                                                                    tokenize = "words",
+                                                                   stemming = TRUE,
+                                                                   weighting = weightBin,
+                                           dictionary = Terms(tox_allbin_dtm))) # original dtm
+
+tox_test_X <- sparseMatrix(i = test9_tox_dtm$i, j = test9_tox_dtm$j, x = test9_tox_dtm$v,
+                  dims = c(test9_tox_dtm$nrow, test9_tox_dtm$ncol), dimnames = test9_tox_dtm$dimnames)
+
+# Add custom features
+tox_test_X <- cbind(tox_test_X, chained_question_marks, chained_exclamation_points, count_question_marks, count_exclamation_points, chained_uppercase, many_uppercase, prop_uppercase)
+
+# Predict
+tox_test_pred9 <- predict(cust_tox_allbin_glm, tox_test_X, type = "class")
+
+# Get misclassification error (mean(y_predicted != y_actual))
+tox_val9 <- tox_test_pred9[, 1]
+tox_misclass7 <- mean(tox_val9 != y_tox_test)
+
+```
+
+### Obscene
+```{r}
+## OBSCENE: punct, stemming, bin weighting
+# from submission 5
+
+```
+
+### Combine
+```{r}
+# Create combined df
+df_submission_9 <- clean_pred(cust_tox_allbin_glm, obs_bincombo_glm, tox_test_X, obs_test5_X)
+
+# Record
+submission_misclass <- rbind(submission_misclass, list("submission 9", tox_misclass9, obs_misclass5), stringsAsFactors = FALSE)
+
+# Write to csv
+write.csv(df_submission_9, "submission_9.csv", row.names = FALSE)
+
+# Get F1 scores
+submission_f1 <- rbind(submission_f1, compile_f1("submission 9", tox_val9, obs_val5, y_tox_test, y_obs_test), stringsAsFactors = FALSE)
+
+```
+
+# Random Forest
+
+## Create random forest
+
+### Toxic
+```{r}
+# Run model
+tox_rf <- randomForest(toxic ~ ., mtry = sqrt(ncol(train_tox_set)), ntree = 500, data = train_tox_set)
+
+
+tox_rf
+```
+
+#### Test model
+```{r}
+tox_pred <- predict(tox_rf, newdata = test_tox_set[-ncol(test_tox_set)], type = "class")
+tox_cm <- prop.table(table(Model_Tox = test_tox_set[, ncol(test_tox_set)], Real_Tox = tox_pred))
+
+# Calculate F1
+tox_F1 <- F_meas(table(Model_Tox = test_tox_set[, ncol(test_tox_set)], Real_Tox = tox_pred))
+
+# Misclassification error
+tox_misclass <- mean(test_tox_set$toxic != tox_pred)
+```
+
+### Obscene
+
+```{r}
+# Run model
+obs_rf <- randomForest(obscene ~ ., mtry = sqrt(ncol(test_obs_set)), ntree = 500, data = test_obs_set)
+obs_rf
+
+tune_obs_rf <- tuneRF(train_obs_set[,-ncol(train_obs_set)], train_obs_set$obscene,
+                 mtryStart = sqrt(ncol(train_obs_set)), stepFactor = 0.5, doBest = TRUE)
+tune_obs_rf
+```
+
+#### Test model
+```{r}
+obs_pred <- predict(obs_rf, newdata = test_obs_set[-ncol(test_obs_set)], type = "class")
+obs_cm <- prop.table(table(Model_Obs = test_obs_set[, ncol(test_obs_set)], Real_Obs = obs_pred))
+
+
+# Calculate F1
+obs_F1 <- F_meas(table(Model_Obs = test_obs_set[, ncol(test_obs_set)], Real_Obs = obs_pred))
+
+# Calculate misclassification rate
+obs_misclass <- mean(test_obs_set$obscene != obs_pred)
+
+## Tune rf version
+tune_obs_pred <- predict(tune_obs_rf, newdata = test_obs_set[-ncol(test_obs_set)], type = "class")
+obs_cm <- prop.table(table(Model_Obs = test_obs_set[, ncol(test_obs_set)], Real_Obs = tune_obs_pred))
+
+
+# Calculate F1
+tune_obs_F1 <- F_meas(table(Model_Obs = test_obs_set[, ncol(test_obs_set)], Real_Obs = tune_obs_pred))
+
+# Calculate misclassification rate
+tune_obs_misclass <- mean(test_obs_set$obscene != tune_obs_pred)
+```
+
+## Prepare submission
+### Toxic
+```{r}
+## TOXIC: whitespace, punct, bin weighting
+# Create dtm
+tox_bin_combo1_dtm <- DocumentTermMatrix(train_corpus, control = list(stripWhitespace = TRUE,
+                                                                   removePunctuation = TRUE,
+                                                                   weighting = weightBin))
+
+# Create matrix
+tox_bin_combo1_X <- sparseMatrix(i = tox_bin_combo1_dtm$i, j = tox_bin_combo1_dtm$j, x = tox_bin_combo1_dtm$v,
+                  dims = c(tox_bin_combo1_dtm$nrow, tox_bin_combo1_dtm$ncol), dimnames = tox_bin_combo1_dtm$dimnames)
+
+# Create models for toxic and obscene
+toxic_bincombo1_glm <- cv.glmnet(tox_bin_combo1_X, y_tox_train, type.measure = "class", family = "binomial")
+
+test_tox_dtm <- DocumentTermMatrix(test_corpus, 
+                            ## without this line predict won't work
+                            control = list(stripWhitespace = TRUE,
+                                           removePunctuation = TRUE,
+                                           weighting = weightBin,
+                                           dictionary = Terms(tox_bin_combo1_dtm))) # original dtm
+
+tox_test_X <- sparseMatrix(i = test_tox_dtm$i, j = test_tox_dtm$j, x = test_tox_dtm$v,
+                  dims = c(test_tox_dtm$nrow, test_tox_dtm$ncol), dimnames = test_tox_dtm$dimnames)
+
+
+# Create "toxic" submission
+toxic_pred <- predict(toxic_bincombo1_glm, tox_test_X, type = "class")
+df_toxic <- data.frame(row.names(toxic_pred), toxic_pred[, 1])
+colnames(df_toxic) <- c("id", "toxic")
+
+
+
+```
+
+### Obscene
+```{r}
+test_obs_dtm <- DocumentTermMatrix(test_corpus, 
+                            ## without this line predict won't work
+                            control = list(removePunctuation = TRUE,
+                                           stemming = TRUE,
+                                           weighting = weightBin,
+                                           dictionary = Terms(bin_obcombo1_dtm))) # original dtm
+
+# Create data frame
+df_test_obs <- as.data.frame(as.matrix(test_obs_dtm))
+names(df_test_obs) <- make.names(names(df_test_obs))
+
+# Add missing columns (source: https://stackoverflow.com/a/43663172)
+missingColumns <- setdiff(colnames(df_obsdtm),colnames(df_test_obs))
+df_test_obs[, missingColumns] <- 0 
+
+# Run model on test set
+test_obs_pred <- predict(obs_rf, df_test_obs, type = "class")
+
+# Create "obscene" submission
+df_obscene <- data.frame(names(test_obs_pred), test_obs_pred)
+colnames(df_obscene) <- c("id", "obscene")
+
+```
+
+### Create submission
+```{r}
+df_submission_8 <- merge(df_obscene, df_toxic, "id")
+
+# Get F1 scores
+submission_f1 <- rbind(submission_f1, list("submission 8", "toxic", 0.8787603), stringsAsFactors = FALSE) # same as submission 6
+submission_f1 <- rbind(submission_f1, list("submission 8", "obscene", obs_F1), stringsAsFactors = FALSE)
+
+# Write to csv
+write.csv(df_submission_8, "submission_8.csv", row.names = FALSE)
+
+# Load df
+load(file = "submission_misclass.RData")
+load(file = "sub6_tox_misclass.RData")
+submission_misclass <- rbind(submission_misclass, list("submission 8", tox_misclass6, obs_misclass), stringsAsFactors = FALSE)
+```

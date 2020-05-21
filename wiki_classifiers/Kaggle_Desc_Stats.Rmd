@@ -1,0 +1,638 @@
+---
+title: "Kaggle_Desc_Stats"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message = False}
+ # Load in necessary libraries
+library("wordcloud")
+library("glmnet")
+library("SnowballC")
+library("e1071")
+library("reshape")
+
+library("tidyverse")
+library("tidytext")
+library("stringr")
+library("caret")
+library("tm")
+
+library("MLmetrics")
+library ("ROCR")
+
+```
+
+
+### Load the text
+``` {r}
+# Import training set
+train_set <- read.csv("my474/train.csv", header = TRUE, sep = ",", encoding = "UTF-8", stringsAsFactors = FALSE)
+
+# Create separate training set in for use with DataframeSource()
+wiki_train <- data.frame(doc_id = train_set$id, text = train_set$comment_text)
+str_replace_all(wiki_train$text, "[\r\n]" , "")
+
+# Import test set
+test_set <- read.csv("test.csv", header = TRUE, sep = ",", encoding = "UTF-8", stringsAsFactors = FALSE)
+
+# Create df to use with VCorpus(Datafr)
+wiki_test <- data.frame(doc_id = test_set$id, text = test_set$comment_text)
+
+# Create corpus
+test_corpus <- VCorpus(DataframeSource(wiki_test))
+
+```
+
+
+## Descriptive Stats
+```{r Descriptive stats}
+# Get number of rows
+nrow(test_set)
+nrow(train_set)
+
+# Create frequency tables
+desc_table <- table(train_set[,3:4])
+desc_prop <- prop.table(table(train_set[,3:4]))
+
+# Create corpus for toxic
+toxic_comments <- wiki_train[which(train_set$toxic == 1), ]
+toxic_corpus <- VCorpus(DataframeSource(toxic_comments))
+
+# Create corpus for obscene
+obscene_comments <- wiki_train[which(train_set$obscene == 1), ]
+obscene_corpus <- VCorpus(DataframeSource(obscene_comments))
+
+# Create dtm for each corpus
+toxic_dtm <- DocumentTermMatrix(toxic_corpus)
+obscene_dtm <- DocumentTermMatrix(obscene_corpus)
+
+# Create wordcloud from above corpora
+tox_wc <- wordcloud(toxic_corpus, max.words = 20)
+obs_wc <- wordcloud(obscene_corpus, max.words = 20)
+
+# Get most frequent terms in each corpus (tf)
+toxic_freq <- data.frame(sort(colSums(as.matrix(toxic_dtm)), decreasing = TRUE))
+toxic_freq <- cbind(toxic_freq, row.names.data.frame(toxic_freq))
+colnames(toxic_freq) <- c("count", "word")
+head(toxic_freq, 20)
+
+obscene_freq <- data.frame(sort(colSums(as.matrix(obscene_dtm)), decreasing = TRUE))
+obscene_freq <- cbind(obscene_freq, row.names.data.frame(obscene_freq))
+colnames(obscene_freq) <- c("count", "word")
+head(obscene_freq, 20)
+
+# Get most frequent terms in each corpus (tf-idf)
+tfidf_tox_dtm <- DocumentTermMatrix(toxic_corpus, control = list(weighting = weightTfIdf))
+tfidf_tox_freq <- data.frame(sort(colSums(as.matrix(tfidf_tox_dtm)), decreasing=TRUE))
+
+tfidf_obs_dtm <- DocumentTermMatrix(obscene_corpus, control = list(weighting = weightTfIdf))
+tfidf_obs_freq <- data.frame(sort(colSums(as.matrix(tfidf_obs_dtm)), decreasing=TRUE))
+
+
+save(tfidf_tox_freq, tfidf_obs_freq, toxic_freq, obscene_freq, tox_wc, obs_wc, desc_prop, desc_table, file = "/Users/mariajoseherrera/Documents/LSE_new/01_Michaelmas Term/MY474/Kaggle/desc_stats.RData")
+```
+
+```{r Prep test set and response vector}
+# Prep for model
+colnames(test_set) <- c("doc_id", "text")
+
+# Combo 1 - Regular weighting
+fit_corpus <- VCorpus(DataframeSource(wiki_train))
+
+# Create response vector
+y_toxic <- as.matrix(train_set$toxic)
+y_obscene <- as.matrix(train_set$obscene)
+
+```
+
+## Submission 1: First submitted model - no pre-processing, binomial glm
+```{r First model - No pre-processing}
+# Create data frame that holds classification
+y <- as.matrix(train_set[, 3:4])
+train_set[,3:4] <- NULL # remove for model calculating
+
+# Combo 1 - No pre-processing
+wiki_corpus <- VCorpus(DataframeSource(wiki_train))
+none_dtm <- DocumentTermMatrix(wiki_corpus) # no pre-processing
+
+# Create sparse matrix for cv.glmnet
+X <- sparseMatrix(i = test_dtm$i, j = test_dtm$j, x = test_dtm$v,
+                  dims = c(test_dtm$nrow, test_dtm$ncol), dimnames = test_dtm$dimnames)
+
+# Calculate cv.glm # ASSUMPTION: BINOMIAL
+combo1_glm <- cv.glmnet(X, y, type.measure = "class", family = "binomial")
+
+# Calculate min CV
+minCV_combos[1] <-combo1_glm$cvm[which.min(combo1_glm$cvm)]
+
+# Optimal lambda and minimal CV error
+combo1_glm$lambda.min
+combo1_glm$cvm[which.min(combo1_glm$cvm)]
+
+plot(combo1_glm)
+
+
+# Create submission
+combo_1 <- predict(combo1_glm, test_X, type = "class")
+submission_1 <- data.frame(test_set$doc_id, combo_1[,1])
+colnames(submission_1) <- c("id", "value")
+submission_1$toxic <- ifelse(submission_1$value == "toxic", 1, 0)
+submission_1$obscene <- ifelse(submission_1$value == "obscene", 1, 0)
+submission_1$value <- NULL
+
+write.csv(submission_1, "submission_1.csv", row.names = FALSE)
+
+```
+
+## Preprocess, clean text
+
+Look at this page! https://cfss.uchicago.edu/notes/supervised-text-classification/
+* using the above page -- stopped at "Exploratory analysis" portion
+
+
+
+```{r}
+## Create different combinations of pre-processed DTM
+# No pre-processing
+test_dtm <- DocumentTermMatrix(wiki_corpus)
+# Create sparse matrix for cv.glmnet
+X <- sparseMatrix(i = test_dtm$i, j = test_dtm$j, x = test_dtm$v,
+                  dims = c(test_dtm$nrow, test_dtm$ncol), dimnames = test_dtm$dimnames)
+# Calculate cv.glm
+toxic_none_glm <- cv.glmnet(X, y_toxic, type.measure = "class", family = "binomial")
+obscene_none_glm <- cv.glmnet(X, y_obscene, type.measure = "class", family = "binomial")
+
+# Remove stopwords
+stpwrds_dtm <- DocumentTermMatrix(fit_corpus, control = list(stopwords = TRUE))
+stpwrds_X <- sparseMatrix(i = stpwrds_dtm$i, j = stpwrds_dtm$j, x = stpwrds_dtm$v,
+                  dims = c(stpwrds_dtm$nrow, stpwrds_dtm$ncol), dimnames = stpwrds_dtm$dimnames)
+toxic_stpwrds_glm <- cv.glmnet(stpwrds_X, y_toxic, type.measure = "class", family = "binomial")
+obscene_stpwrds_glm <- cv.glmnet(stpwrds_X, y_obscene, type.measure = "class", family = "binomial")
+
+# Tf-idf weighting
+tfidf_dtm <- DocumentTermMatrix(fit_corpus, control = list(weighting = weightTfIdf))
+tfidf_X <- sparseMatrix(i = stpwrds_dtm$i, j = stpwrds_dtm$j, x = stpwrds_dtm$v,
+                  dims = c(tfidf_dtm$nrow, tfidf_dtm$ncol), dimnames = tfidf_dtm$dimnames)
+toxic_tfidf_glm <- cv.glmnet(tfidf_X, y_toxic, type.measure = "class", family = "binomial")
+obscene_tfidf_glm <- cv.glmnet(tfidf_X, y_obscene, type.measure = "class", family = "binomial")
+
+# Stemming
+stemmed_dtm <- DocumentTermMatrix(fit_corpus, control = list(stemming = TRUE))
+stemmed_X <- sparseMatrix(i = stemmed_dtm$i, j = stemmed_dtm$j, x = stemmed_dtm$v,
+                  dims = c(stemmed_dtm$nrow, stemmed_dtm$ncol), dimnames = stemmed_dtm$dimnames)
+stemmed_glm <- cv.glmnet(stemmed_X, y, type.measure = "class", family = "binomial")
+toxic_stemmed_glm <- cv.glmnet(stemmed_X, y_toxic, type.measure = "class", family = "binomial")
+obscene_stemmed_glm <- cv.glmnet(stemmed_X, y_obscene, type.measure = "class", family = "binomial")
+
+# Tokenize
+token_dtm <- DocumentTermMatrix(fit_corpus, control = list(tokenize = "words"))
+token_X <- sparseMatrix(i = token_dtm$i, j = token_dtm$j, x = token_dtm$v,
+                  dims = c(token_dtm$nrow, token_dtm$ncol), dimnames = token_dtm$dimnames)
+token_glm <- cv.glmnet(token_X, y, type.measure = "class", family = "binomial")
+toxic_token_glm <- cv.glmnet(token_X, y_toxic, type.measure = "class", family = "binomial")
+obscene_token_glm <- cv.glmnet(token_X, y_obscene, type.measure = "class", family = "binomial")
+
+# Remove numbers
+rmvnumbers_dtm <- DocumentTermMatrix(fit_corpus, control = list(removeNumbers = TRUE))
+rmvnumbers_X <- sparseMatrix(i = rmvnumbers_dtm$i, j = rmvnumbers_dtm$j, x = rmvnumbers_dtm$v,
+                  dims = c(rmvnumbers_dtm$nrow, rmvnumbers_dtm$ncol), dimnames = rmvnumbers_dtm$dimnames)
+rmvnumbers_glm <- cv.glmnet(rmvnumbers_X, y, type.measure = "class", family = "binomial")
+toxic_rmvnumbers_glm <- cv.glmnet(rmvnumbers_X, y_toxic, type.measure = "class", family = "binomial")
+obscene_rmvnumbers_glm <- cv.glmnet(rmvnumbers_X, y_obscene, type.measure = "class", family = "binomial")
+
+
+# Remove punctuation
+rmvpunct_dtm <- DocumentTermMatrix(fit_corpus, control = list(removePunctuation = TRUE))
+rmvpunct_X <- sparseMatrix(i = rmvpunct_dtm$i, j = rmvpunct_dtm$j, x = rmvpunct_dtm$v,
+                  dims = c(rmvpunct_dtm$nrow, rmvpunct_dtm$ncol), dimnames = rmvpunct_dtm$dimnames)
+rmvpunct_glm <- cv.glmnet(rmvpunct_X, y, type.measure = "class", family = "binomial")
+toxic_rmvpunct_glm <- cv.glmnet(rmvpunct_X, y_toxic, type.measure = "class", family = "binomial")
+obscene_rmvpunct_glm <- cv.glmnet(rmvpunct_X, y_obscene, type.measure = "class", family = "binomial")
+
+
+##############
+# # Create sparse matrix for cv.glmnet
+# X <- sparseMatrix(i = test_dtm$i, j = test_dtm$j, x = test_dtm$v,
+#                   dims = c(test_dtm$nrow, test_dtm$ncol), dimnames = test_dtm$dimnames)
+# 
+# # Calculate cv.glm # ASSUMPTION: BINOMIAL
+# combo1_glm <- cv.glmnet(X, y, type.measure = "class", family = "binomial")
+# 
+# # Calculate min CV
+# minCV_combos[1] <-combo1_glm$cvm[which.min(combo1_glm$cvm)]
+# 
+# # Optimal lambda and minimal CV error
+# combo1_glm$lambda.min
+# combo1_glm$cvm[which.min(combo1_glm$cvm)]
+###############
+
+
+
+```
+
+
+
+
+
+
+YO CLEAN THIS SHIT UP ^^ YOU ONLY NEED THE TEST SET CODE ONCE SO BREAK THAT OUT SOMEWHERE ELSE
+AND KEEP TRACK OF THE MODELS YOU'VE TRIED / ARE SUBMITTING -- KEEP NOTES ON STARTING POINT, THOUGHT PROCESS BEHIND HYPERPARAMETER TUNING
+AND OTHER RELEVANT SHIT
+
+
+## GLM models
+```{r}
+# Create df to hold model results (min lambda and min cv error)
+df_glm_results <- data.frame(0, 0, 0, 0)
+colnames(df_glm_results) <- c("preprocessing", "category","min_lambda", "min_cv")
+
+# Define classification categories
+cat_tox <- as.factor("toxic")
+cat_obsc <- as.factor("obscene")
+
+# Create lists of models
+toxic_models <- list(toxic_none_glm, toxic_stpwrds_glm, toxic_tfidf_glm, toxic_stemmed_glm, toxic_token_glm,
+                     toxic_rmvnumbers_glm, toxic_rmvpunct_glm)
+obscene_models <- list(obscene_none_glm, obscene_stpwrds_glm, obscene_tfidf_glm, obscene_stemmed_glm,
+                       obscene_token_glm, obscene_rmvnumbers_glm, obscene_rmvpunct_glm)
+
+# Create list of model names
+names <- c("none", "stopwords", "tfidf", "stemmed", "tokenized", "removed numbers", "removed punct")
+
+# Run glm models on simple pre-processing options
+for(i in 1:length(models)){
+  df_glm_results <- glm_results(names[[i]], cat_tox, toxic_models[[i]], y_toxic, df_glm_results)
+  df_glm_results <- glm_results(names[[i]], cat_obsc, obscene_models[[i]], y_obscene, df_glm_results)
+}
+
+# Format df_glm_results
+df_glm_results <- df_glm_results[-c(1), ] # remove starter row (held 0s to create df)
+
+# Find best pre-processing options for each category
+best_preprocess <- df_glm_results %>%
+  arrange(min_cv) %>% 
+  group_by(category)
+
+
+##### Predict using models
+# Stopwords
+# X <- sparseMatrix(i = stpwrds_dtm$i, j = stpwrds_dtm$j, x = stpwrds_dtm$v,
+#                   dims = c(stpwrds_dtm$nrow, stpwrds_dtm$ncol), dimnames = stpwrds_dtm$dimnames)
+# glm_mod <- cv.glmnet(X, y, type.measure = "class", family = "binomial")
+none_X
+toxic_none_glm
+obscene_none_glm
+
+toxic_pred <- predict(toxic_none_glm, X, type = "class")
+obscene_pred <- predict(obscene_none_glm, X, type = "class")
+
+# Create df with predicted outcomes
+df_submission <- data.frame(test_set[1], toxic_pred[, 1], obscene_pred[, 1])
+colnames(df_submission) <- c("id", "toxic", "obscene")
+df_submission$toxic <- ifelse(df_submission$value == "toxic", 1, 0)
+df_submission$obscene <- ifelse(df_submission$value == "obscene", 1, 0)
+
+
+# Calculate F1
+toxic_F1 <- F_meas(table(as.matrix(df_submission$toxic), y_toxic))
+obscene_F1 <- F_meas(table(as.matrix(df_submission$obscene), y_obscene))
+################### ^above is trial for below
+
+
+
+
+
+
+test <- compile_f1("tfidf", tfidf_out, y_toxic, y_obscene)
+
+##### UPDATE BELOW WITH NEW MODEL PARAMS / ARGUMNETS (NEED TO TAKE IN BOTH TOXIC AND OBSCENE MODELS)
+
+# Create df to hold output
+f1_results <- data.frame()
+
+## No pre-processing
+# Predict classification using model
+nopreproc_out <- clean_pred(toxic_none_glm, obscene_none_glm, X, X)
+
+# Calculate F1 score
+f1_results <- compile_f1("none", nopreproc_out, y_toxic, y_obscene)
+
+## Tf-idf
+# Predict classification using model
+tfidf_out <- clean_pred(toxic_tfidf_glm, obscene_tfidf_glm, tfidf_X, tfidf_X)
+
+# Calculate F1 score
+f1_results <- rbind(f1_results, compile_f1("tfidf", tfidf_out, y_toxic, y_obscene))
+
+## Stemmed
+# Predict classification using model
+stemmed_out <- clean_pred(toxic_stemmed_glm, obscene_stemmed_glm, stemmed_X, stemmed_X)
+
+# Calculate F1 score
+f1_results <- rbind(f1_results, compile_f1("stemmed", stemmed_out, y_toxic, y_obscene))
+
+## Token
+# Predict classification using model
+token_out <- clean_pred(toxic_token_glm, obscene_token_glm, token_X)
+
+# Calculate F1 score
+f1_results <- rbind(f1_results, compile_f1("token", token_out, y_toxic, y_obscene))
+
+## Remove numbers
+# Predict classification using model
+rmvnumbers_out <- clean_pred(toxic_rmvnumbers_glm, obscene_rmvnumbers_glm, rmvnumbers_X, rmvnumbers_X)
+
+# Calculate F1 score
+f1_results <- rbind(f1_results, compile_f1("remove numbers", rmvnumbers_out,  y_toxic, y_obscene))
+
+## Remove punctuation
+# Predict classification using model
+rmvpunct_out <- clean_pred(toxic_rmvpunct_glm, obscene_rmvpunct_glm, rmvpunct_X, rmvpunct_X)
+
+# Calculate F1 score
+f1_results <- rbind(f1_results, compile_f1("remove punctuation", rmvpunct_out, y_toxic, y_obscene))
+
+# Find best pre-processing options for each category
+best_f1_preprocess <- f1_results %>%
+  arrange(F1) %>% 
+  group_by(category)
+
+```
+
+
+```{r TEST CODE FOR GLM}
+X <- sparseMatrix(i = tfidf_dtm$i, j = tfidf_dtm$j, x = tfidf_dtm$v,
+                  dims = c(tfidf_dtm$nrow, tfidf_dtm$ncol), dimnames = tfidf_dtm$dimnames)
+
+# Calculate cv.glm # ASSUMPTION: BINOMIAL
+test_glm <- cv.glmnet(X, y, type.measure = "class", family = "binomial")
+
+# Calculate min CV
+minCV_combos[1] <-combo1_glm$cvm[which.min(combo1_glm$cvm)]
+
+# Optimal lambda and minimal CV error
+test_glm$lambda.min
+test_glm$cvm[which.min(combo1_glm$cvm)]
+
+combo1_glm$lambda.min
+combo1_glm$cvm[which.min(combo1_glm$cvm)]
+
+```
+
+
+## Functions
+```{r}
+# Create function to run glm models
+glm_results <- function(name, category, glm_mod, response_vector, df_results){
+  min_lambda <- glm_mod$lambda.min
+  min_cv <- glm_mod$cvm[which.min(glm_mod$cvm)]
+  new_row <- list(name, category, min_lambda, min_cv)
+  df_results <- rbind(df_results, new_row, stringsAsFactors = FALSE)
+  colnames(df_results) <- c("preprocessing", "category", "min_lambda", "min_cv")
+  return(df_results)
+}
+
+### TRYING OUT FUNCTION
+clean_pred <- function(toxic_glm, obscene_glm, test_toxic_X, test_obscene_X){
+  
+  toxic_pred <- predict(toxic_glm, test_toxic_X, type = "class")
+  obscene_pred <- predict(obscene_glm, test_obscene_X, type = "class")
+  df_toxic <- data.frame(row.names(toxic_pred), toxic_pred[, 1])
+  colnames(df_toxic) <- c("id", "toxic")
+  df_obscene <- data.frame(row.names(obscene_pred), obscene_pred[, 1])
+  colnames(df_obscene) <- c("id", "obscene")
+  df_submission <- merge(df_toxic, df_obscene, "id")
+  
+  return(df_submission)
+}
+
+
+# Test function
+# df_sub <- create_submission(combo1_glm, test_X, test_set)
+# write.csv(df_sub, "submission_1.csv", row.names = FALSE)
+
+#### TRYING OUT FUNCTION
+compile_f1 <- function(name, df_predictions, toxic_responsevector, obscene_responsevector){
+  # Create data frame to hold F1 scores
+  f1_results <- data.frame()
+  
+  # Calculate F1
+  toxic_F1 <- F_meas(table(as.matrix(df_predictions$toxic), toxic_responsevector))
+  obscene_F1 <- F_meas(table(as.matrix(df_predictions$obscene), obscene_responsevector))
+  
+  # Add to df
+  toxic_row <- list(as.character(name), as.character("toxic"), toxic_F1)
+  f1_results <- rbind(f1_results, toxic_row, stringsAsFactors = FALSE)
+  
+  obscene_row <- list(as.character(name), as.character("obscene"), obscene_F1)
+  f1_results <- rbind(f1_results, obscene_row, stringsAsFactors = FALSE)
+  
+  # Format df
+  colnames(f1_results) <- c("name", "category", "F1")
+  
+  return(f1_results)
+}
+
+
+```
+
+## Submission 2
+```{r}
+write.csv(rmvpunct_out, "submission_2.csv", row.names = FALSE)
+
+```
+
+## Explore more pre-processing
+
+* Given the exploratory cv error results and the F1 scores, I chose to further explore combinations of pre-processing choices that yielded favorable cv errors and F1 scores, as noted above.
+* In the case of "toxic" classification, this means exploring combinations of **number removal, text tokenization, and stopword removal.**
+* For "obscene" classification, this means exploring combinations of **stemming, punctuation removal, and text tokenization.**
+```{r}
+
+## Toxic corpus
+# Remove stopwords, tokenize, stem
+toxic_combo <- DocumentTermMatrix(fit_corpus, control = list(stopwords = TRUE,
+                                                           tokenize = "words",
+                                                           removeNumbers = TRUE))
+
+# Create sparse matrix
+toxic_combo_X <- sparseMatrix(i = toxic_combo$i, j = toxic_combo$j, x = toxic_combo$v,
+                  dims = c(toxic_combo$nrow, toxic_combo$ncol),
+                  dimnames = toxic_combo$dimnames)
+
+# Create glm
+toxic_combo_glm <- cv.glmnet(toxic_combo_X, y_toxic, type.measure = "class", family = "binomial")
+
+## Obscene corpus
+obscene_combo <- DocumentTermMatrix(fit_corpus, control = list(stemming = TRUE,
+                                                           tokenize = "words",
+                                                           removePunctuation = TRUE))
+
+# Create sparse matrix
+obscene_combo_X <- sparseMatrix(i = obscene_combo$i, j = obscene_combo$j, x = obscene_combo$v,
+                  dims = c(obscene_combo$nrow, obscene_combo$ncol),
+                  dimnames = obscene_combo$dimnames)
+
+# Create glm
+obscene_combo_glm <- cv.glmnet(obscene_combo_X, y_obscene, type.measure = "class", family = "binomial")
+
+## Create predicted classification and calculate F1 score
+combo_out <- clean_pred(toxic_combo_glm, obscene_combo_glm, toxic_combo_X, obscene_combo_X)
+combo_f1_results <- data.frame()
+combo_f1_results <- rbind(combo_f1_results, compile_f1("TOX: stopwords, token, remove numbers / OBS: stemming, tokenize, punct", combo_out, y_toxic, y_obscene))
+
+# Calculate CV
+df_glm_results <- glm_results("stopwords, token, remove numbers", "toxic", toxic_combo_glm, y_toxic, df_glm_results)
+df_glm_results <- glm_results(" stemming, tokenize, remove punct", "obscene", obscene_combo_glm, y_obscene, df_glm_results)
+
+```
+
+## Submission 3
+```{r}
+write.csv(combo_out, "submission_3.csv", row.names = FALSE)
+```
+
+## Another combo
+```{r}
+## Toxic corpus
+# Remove stopwords, tokenize, stem
+toxic_combo <- DocumentTermMatrix(fit_corpus, control = list(stopwords = TRUE,
+                                                           tokenize = "words"))
+
+# Create sparse matrix
+toxic_combo_X <- sparseMatrix(i = toxic_combo$i, j = toxic_combo$j, x = toxic_combo$v,
+                  dims = c(toxic_combo$nrow, toxic_combo$ncol),
+                  dimnames = toxic_combo$dimnames)
+
+# Create glm
+toxic_combo_glm <- cv.glmnet(toxic_combo_X, y_toxic, type.measure = "class", family = "binomial")
+
+## Obscene corpus
+obscene_combo <- DocumentTermMatrix(fit_corpus, control = list(stemming = TRUE,
+                                                           tokenize = "words"))
+
+# Create sparse matrix
+obscene_combo2_X <- sparseMatrix(i = obscene_combo$i, j = obscene_combo$j, x = obscene_combo$v,
+                  dims = c(obscene_combo$nrow, obscene_combo$ncol),
+                  dimnames = obscene_combo$dimnames)
+
+# Create glm
+obscene_combo2_glm <- cv.glmnet(obscene_combo_X, y_obscene, type.measure = "class", family = "binomial")
+
+## Create predicted classification and calculate F1 score
+#function(toxic_glm, obscene_glm, sprs_matrix, testset)
+combo_out <- clean_pred(toxic_combo_glm, obscene_combo2_glm, toxic_combo_X, obscene_combo_X)
+combo_f1_results <- data.frame()
+combo_f1_results <- rbind(combo_f1_results, compile_f1("TOX: stopwords, token, remove numbers / OBS: stemming, tokenize, punct", combo_out, y_toxic, y_obscene))
+```
+
+## Check CV error for models
+```{r}
+df_glm_results <- glm_results("stopwords, token", "toxic", toxic_combo_glm, y_toxic, df_glm_results)
+df_glm_results <- glm_results(" stemming, tokenize", "obscene", obscene_combo_glm, y_obscene, df_glm_results)
+
+
+
+```
+
+
+## New toxic model
+```{r}
+# Remove stopwords, tokenize, stem
+toxic_2 <- DocumentTermMatrix(fit_corpus, control = list(removeNumbers = TRUE,
+                                                           tokenize = "words"))
+
+# Create sparse matrix
+toxic_2_X <- sparseMatrix(i = toxic_combo$i, j = toxic_combo$j, x = toxic_combo$v,
+                  dims = c(toxic_combo$nrow, toxic_combo$ncol),
+                  dimnames = toxic_combo$dimnames)
+
+# Create glm
+toxic_2_glm <- cv.glmnet(toxic_combo_X, y_toxic, type.measure = "class", family = "binomial")
+
+# Check CV error
+df_glm_results <- glm_results("remove numbers, token", "toxic", toxic_2_glm, y_toxic, df_glm_results)
+
+```
+
+## Submission 4
+```{r}
+# Take best toxic and best obscene
+# data is test set
+
+# Create separate training set in for use with DataframeSource()
+wiki_test <- data.frame(doc_id = test_set$id, text = test_set$comment_text)
+
+# Create corpus
+test_corpus <- VCorpus(DataframeSource(wiki_test))
+
+
+# Best toxic: remove numbers
+
+# Create test set dtm, ensuring dimensions match training set
+# Source: https://stackoverflow.com/a/35813297
+test_tox_dtm <- DocumentTermMatrix(test_corpus, 
+                            ## without this line predict won't work
+                            control = list(removeNumbers = TRUE,
+                            dictionary = Terms(rmvnumbers_dtm))) # original dtm
+# Create sparse matrix to use in prediction
+test_tox_X <- sparseMatrix(i = test_tox_dtm$i, j = test_tox_dtm$j, x = test_tox_dtm$v,
+                  dims = c(test_tox_dtm$nrow, test_tox_dtm$ncol), dimnames = test_tox_dtm$dimnames)
+
+# Best obscene: stemming, tokenize
+
+# Create test set dtm, ensuring dimensions match training set
+# Source: https://stackoverflow.com/a/35813297
+test_obs_dtm <- DocumentTermMatrix(test_corpus, 
+                            ## without this line predict won't work
+                            control = list(stemmed = TRUE,
+                                           tokenize = "words",
+                                           dictionary = Terms(obscene_combo))) # original dtm
+# Create sparse matrix to use in prediction
+test_obs_X <- sparseMatrix(i = test_obs_dtm$i, j = test_obs_dtm$j, x = test_obs_dtm$v,
+                  dims = c(test_obs_dtm$nrow, test_obs_dtm$ncol), dimnames = test_obs_dtm$dimnames)
+
+# Create prediction df
+df_submission_4 <- clean_pred(toxic_rmvnumbers_glm, obscene_combo2_glm, test_tox_X, test_obs_X)
+
+# Write to csv
+write.csv(df_submission_4, "submission_4.csv", row.names = FALSE)
+```
+
+## Remove infrequent words
+```{r}
+# Try removing infrequent words with no other preprocessing
+freq_dtm <- DocumentTermMatrix(wiki_corpus,
+                          control = list(bounds = list(global = c(5, 10000))))
+
+# Create sparse matrix
+freq_X <- sparseMatrix(i = freq_dtm$i, j = freq_dtm$j, x = freq_dtm$v,
+                  dims = c(freq_dtm$nrow, freq_dtm$ncol), dimnames = freq_dtm$dimnames)
+
+# Create glm model
+toxic_freq_glm <- cv.glmnet(freq_X, y_toxic, type.measure = "class", family = "binomial")
+obscene_freq_glm <- cv.glmnet(freq_X, y_obscene, type.measure = "class", family = "binomial")
+
+# Get best cv error and lambda
+df_glm_results <- glm_results("remove infrequent terms", "toxic", toxic_freq_glm, y_toxic, df_glm_results)
+df_glm_results <- glm_results("remove infrequent terms", "obscene", obscene_freq_glm, y_obscene, df_glm_results)
+
+
+```
+
+
+
+
+## Check coeff for models
+```{r}
+# Get coefs
+coefs <- as.vector(coef(raw_glm))
+names(coefs) <- dimnames(coef(raw_glm))[[1]]
+# Top 10 largest coeff values
+head(names(coefs[order(coefs, decreasing = TRUE)]), n = 10)
+
+```
